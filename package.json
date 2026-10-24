@@ -1,0 +1,128 @@
+{
+  "name": "simple-video-player",
+  "displayName": "Video Player: Smooth & Loop",
+  "description": "High-performance video player for VS Code. Zero-memory streaming handles 20GB+ files smoothly without freezing the IDE. Features instant auto-loop, A-B repeat, speed control, and shortcuts (MP4, MOV, M4V, WebM).",
+  "version": "1.0.0",
+  "publisher": "globalpaws",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "scripts": {
+    "lint": "node -c extension.js && node test/verify.js",
+    "lint:fix": "node -c extension.js && node test/verify.js",
+    "test": "node test/verify.js",
+    "package": "vsce package",
+    "package:vsix": "npx --yes @vscode/vsce package --allow-missing-repository"
+  },
+  "keywords": [
+    "video",
+    "video-player",
+    "player",
+    "mp4",
+    "mov",
+    "webm",
+    "m4v",
+    "loop",
+    "repeat",
+    "media",
+    "preview",
+    "streaming"
+  ],
+  "categories": [
+    "Visualization",
+    "Media",
+    "Other"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "simple-video-player.play",
+        "title": "Video Player: Open Video"
+      },
+      {
+        "command": "simple-video-player.openExternal",
+        "title": "Video Player: Open in External App (QuickTime / VLC)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "simple-video-player.play",
+          "when": "resourceExtname =~ /\\.(mp4|mov|m4v|webm)$/i",
+          "group": "navigation@1"
+        },
+        {
+          "command": "simple-video-player.openExternal",
+          "when": "resourceExtname =~ /\\.(mp4|mov|m4v|webm)$/i",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "simple-video-player.play",
+          "when": "resourceExtname =~ /\\.(mp4|mov|m4v|webm)$/i",
+          "group": "navigation@1"
+        },
+        {
+          "command": "simple-video-player.openExternal",
+          "when": "resourceExtname =~ /\\.(mp4|mov|m4v|webm)$/i",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "customEditors": [
+      {
+        "viewType": "simple-video-player.editor",
+        "displayName": "Video Player",
+        "selector": [
+          {
+            "filenamePattern": "*.{mp4,mov,m4v,webm,MP4,MOV,M4V,WEBM}"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "configuration": {
+      "title": "Video Player",
+      "properties": {
+        "simple-video-player.autoLoop": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically loop video playback when it reaches the end."
+        },
+        "simple-video-player.autoPlay": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start playing the video when opened."
+        },
+        "simple-video-player.defaultVolume": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Default volume level (0.0 to 1.0)."
+        },
+        "simple-video-player.skipSeconds": {
+          "type": "number",
+          "default": 10,
+          "description": "Number of seconds to skip backward / forward."
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GlobalPaws/vscode-video-player.git"
+  },
+  "bugs": {
+    "url": "https://github.com/GlobalPaws/vscode-video-player/issues"
+  },
+  "homepage": "https://github.com/GlobalPaws/vscode-video-player#readme",
+  "license": "MIT",
+  "author": {
+    "name": "GlobalPaws",
+    "url": "https://github.com/GlobalPaws"
+  }
+}
