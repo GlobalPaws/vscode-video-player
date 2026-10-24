@@ -2,7 +2,7 @@
   "name": "simple-video-player",
   "displayName": "Video Player: Smooth & Loop",
   "description": "High-performance video player for VS Code. Zero-memory streaming handles 20GB+ files smoothly without freezing the IDE. Features instant auto-loop, A-B repeat, speed control, and shortcuts (MP4, MOV, M4V, WebM).",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "globalpaws",
   "icon": "icon.png",
   "engines": {
@@ -31,7 +31,6 @@
   ],
   "categories": [
     "Visualization",
-    "Media",
     "Other"
   ],
   "main": "./extension.js",

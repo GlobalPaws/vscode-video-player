@@ -18,6 +18,8 @@
   - これにより、ユーザーが動画ファイルをクリックした際に「The file is not displayed in the text editor because it is either binary or uses an unsupported text encoding. Open Anyway」という警告ダイアログが表示されるのを完全に防止し、直接動画プレイヤーを起動する。
 - **アクティベーションイベントの記述省略**:
   - VS Code ^1.75.0 以降の仕様に基づき、`commands` や `customEditors` からアクティベーションイベントが自動推論されるため、冗長な `"activationEvents"` は記述しない。
+- **Marketplace カテゴリの制限**:
+  - VS Code Marketplace の `categories` には公式定義（`Visualization`, `Other`, `Programming Languages` 等）のみを使用すること（`Media` などの非標準カテゴリはアップロード時に拒絶される）。
 
 ---
 

@@ -1,5 +1,10 @@
 # Change Log
 
+## [1.0.1] - 2026-10-24
+
+### Fixed
+- VS Code Marketplace のカテゴリ制限に準拠し、非対応カテゴリ `Media` を削除して `Visualization`, `Other` に修正。
+
 ## [1.0.0] - 2026-10-24
 
 ### Added

@@ -49,6 +49,18 @@ assert.strictEqual(editor.priority, 'default', 'Must have priority: default to p
 const selector = editor.selector[0].filenamePattern;
 assert.ok(selector.includes('mp4') && selector.includes('mov') && selector.includes('webm') && selector.includes('m4v'), 'Supports mp4, mov, webm, m4v');
 
+// Verify categories match official Marketplace categories
+const validCategories = [
+  'Programming Languages', 'Snippets', 'Linters', 'Themes', 'Debuggers',
+  'Formatters', 'Keymaps', 'SCM Providers', 'Other', 'Extension Packs',
+  'Language Packs', 'Data Science', 'Machine Learning', 'Visualization',
+  'Notebooks', 'Education', 'Testing'
+];
+assert.ok(Array.isArray(pkg.categories), 'categories must be an array');
+for (const cat of pkg.categories) {
+  assert.ok(validCategories.includes(cat), `Category '${cat}' must be a valid VS Code Marketplace category`);
+}
+
 // 3. Verify extension.js
 const extCode = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
 
