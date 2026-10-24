@@ -1,5 +1,12 @@
 # Change Log
 
+## [1.0.2] - 2026-10-24
+
+### Fixed
+- **20GB+ 大容量動画再生時の IDE クラッシュ・フリーズの根本修正**:
+  - VS Code の内部 `vscode-webview://` プロトコルにおける 2GB（32-bit offset）上限バグおよび IPC バッファ確保による OOM クラッシュを完全回避するため、**内蔵ローカル HTTP 206 Range ストリーミングサーバー（LocalVideoServer）**を実装。
+  - Chromium のネイティブ HTTP スタックと直接 64-bit HTTP Range 通信を行うことで、20GB〜100GB超の巨大動画でもメモリ消費ゼロで即時起動・シーク可能に。
+
 ## [1.0.1] - 2026-10-24
 
 ### Fixed

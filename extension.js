@@ -1,8 +1,174 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
+
+// Singleton Local HTTP Range Streaming Server
+// Handles 20GB+ video files via native HTTP 206 Partial Content without consuming memory or freezing the IDE.
+class LocalVideoServer {
+  constructor() {
+    this.server = null;
+    this.port = 0;
+    this.activeFiles = new Map(); // token -> { filePath, fileSize, mimeType }
+  }
+
+  async start() {
+    if (this.server) return this.port;
+
+    return new Promise((resolve, reject) => {
+      this.server = http.createServer((req, res) => {
+        // CORS Headers for VS Code Webview
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Range');
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
+
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+
+        try {
+          const url = new URL(req.url, `http://127.0.0.1:${this.port}`);
+          const token = url.searchParams.get('token');
+          const fileInfo = this.activeFiles.get(token);
+
+          if (!fileInfo || !fs.existsSync(fileInfo.filePath)) {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('Video not found or token expired');
+            return;
+          }
+
+          const { filePath, fileSize, mimeType } = fileInfo;
+          const range = req.headers.range;
+
+          if (!range) {
+            // No range header: return 200 with Accept-Ranges
+            const headers = {
+              'Content-Length': fileSize,
+              'Content-Type': mimeType,
+              'Accept-Ranges': 'bytes',
+              'Cache-Control': 'no-cache'
+            };
+            res.writeHead(200, headers);
+            if (req.method === 'HEAD') {
+              res.end();
+            } else {
+              // Only stream first 2MB if full file is requested without Range
+              const stream = fs.createReadStream(filePath, { start: 0, end: Math.min(fileSize - 1, 2097151) });
+              stream.pipe(res);
+              req.on('close', () => stream.destroy());
+            }
+            return;
+          }
+
+          // Parse 64-bit HTTP Range: bytes=start-end
+          const parts = range.replace(/bytes=/, "").split("-");
+          const start = parseInt(parts[0], 10);
+          let end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+          if (isNaN(start) || start >= fileSize || end >= fileSize || start > end) {
+            res.writeHead(416, {
+              'Content-Range': `bytes */${fileSize}`,
+              'Content-Type': 'text/plain'
+            });
+            res.end();
+            return;
+          }
+
+          // Cap max chunk to 16MB to optimize socket throughput and avoid buffering bottlenecks
+          const maxChunk = 16 * 1024 * 1024;
+          if (end - start + 1 > maxChunk) {
+            end = start + maxChunk - 1;
+          }
+
+          const chunkSize = (end - start) + 1;
+          const stream = fs.createReadStream(filePath, { start, end });
+
+          res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunkSize,
+            'Content-Type': mimeType,
+            'Cache-Control': 'no-cache'
+          });
+
+          stream.pipe(res);
+
+          stream.on('error', () => {
+            if (!res.headersSent) {
+              res.writeHead(500);
+            }
+            res.end();
+          });
+
+          req.on('close', () => {
+            stream.destroy();
+          });
+        } catch {
+          if (!res.headersSent) {
+            res.writeHead(500);
+          }
+          res.end();
+        }
+      });
+
+      this.server.listen(0, '127.0.0.1', () => {
+        this.port = this.server.address().port;
+        resolve(this.port);
+      });
+
+      this.server.on('error', reject);
+    });
+  }
+
+  registerFile(filePath) {
+    let stat;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      stat = { size: 0 };
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+    // Chromium plays H.264/AAC MOV files as video/mp4 container
+    let mimeType = 'video/mp4';
+    if (ext === '.webm') mimeType = 'video/webm';
+
+    const token = crypto.randomBytes(16).toString('hex');
+    this.activeFiles.set(token, {
+      filePath,
+      fileSize: stat.size,
+      mimeType
+    });
+
+    const videoUrl = `http://127.0.0.1:${this.port}/video?token=${token}`;
+    return { token, videoUrl, fileSize: stat.size };
+  }
+
+  unregisterFile(token) {
+    this.activeFiles.delete(token);
+  }
+
+  dispose() {
+    if (this.server) {
+      this.server.close();
+      this.server = null;
+    }
+    this.activeFiles.clear();
+  }
+}
+
+const localVideoServer = new LocalVideoServer();
 
 function activate(context) {
+  // Ensure local server is cleaned up on deactivate
+  context.subscriptions.push({
+    dispose: () => localVideoServer.dispose()
+  });
+
   // 1. Custom Editor Provider (Default priority for video files)
   context.subscriptions.push(SimpleVideoPlayerEditorProvider.register(context));
 
@@ -76,7 +242,15 @@ class SimpleVideoPlayerEditorProvider {
     const filePath = document.uri.fsPath;
     const fileDir = vscode.Uri.file(path.dirname(filePath));
 
-    // Allow webview to load files from the video's directory and extension directory
+    // Ensure Local HTTP Range Server is running
+    await localVideoServer.start();
+    const { token, videoUrl, fileSize } = localVideoServer.registerFile(filePath);
+
+    // Unregister file token when Webview panel is closed
+    webviewPanel.onDidDispose(() => {
+      localVideoServer.unregisterFile(token);
+    });
+
     webviewPanel.webview.options = {
       enableScripts: true,
       localResourceRoots: [
@@ -88,26 +262,10 @@ class SimpleVideoPlayerEditorProvider {
     const fileName = path.basename(filePath);
     const ext = path.extname(filePath).toLowerCase();
 
-    // Determine MIME type
     let mimeType = 'video/mp4';
-    if (ext === '.mov') mimeType = 'video/quicktime';
-    else if (ext === '.webm') mimeType = 'video/webm';
-    else if (ext === '.m4v') mimeType = 'video/x-m4v';
+    if (ext === '.webm') mimeType = 'video/webm';
 
-    // File stat (size formatted) - Zero memory footprint!
-    let formattedSize = '';
-    let rawSizeBytes = 0;
-    try {
-      const stat = fs.statSync(filePath);
-      rawSizeBytes = stat.size;
-      formattedSize = formatBytes(stat.size);
-    } catch {
-      formattedSize = 'Unknown size';
-    }
-
-    // Direct streaming URI via VSCode's built-in Range-supported webview server.
-    // DOES NOT load file into Node.js heap memory, so 20GB+ files open instantly with zero lag!
-    const videoWebviewUri = webviewPanel.webview.asWebviewUri(document.uri);
+    const formattedSize = formatBytes(fileSize);
 
     // Read user configuration
     const config = vscode.workspace.getConfiguration('simple-video-player');
@@ -155,10 +313,10 @@ class SimpleVideoPlayerEditorProvider {
     webviewPanel.webview.html = this.getHtmlForWebview(
       webviewPanel.webview,
       fileName,
-      videoWebviewUri,
+      videoUrl,
       mimeType,
       formattedSize,
-      rawSizeBytes,
+      fileSize,
       autoLoopDefault,
       autoPlay,
       defaultVolume,
@@ -182,7 +340,6 @@ class SimpleVideoPlayerEditorProvider {
     subtitleSrc,
     subtitleLabel
   ) {
-    // Generate safe CSP
     const cspSource = webview.cspSource;
 
     return `<!DOCTYPE html>
@@ -190,7 +347,7 @@ class SimpleVideoPlayerEditorProvider {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; media-src ${cspSource} vscode-webview: vscode-resource: blob: data:; img-src ${cspSource} data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; media-src http://127.0.0.1:* http://localhost:* ${cspSource} vscode-webview: vscode-resource: blob: data:; img-src ${cspSource} data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
   <title>${escapeHtml(fileName)}</title>
   <style>
     * {
@@ -213,7 +370,6 @@ class SimpleVideoPlayerEditorProvider {
       align-items: center;
     }
 
-    /* Video Container */
     #player-container {
       position: relative;
       width: 100%;
@@ -234,7 +390,6 @@ class SimpleVideoPlayerEditorProvider {
       cursor: pointer;
     }
 
-    /* Top Title Overlay */
     #top-bar {
       position: absolute;
       top: 0;
@@ -280,6 +435,12 @@ class SimpleVideoPlayerEditorProvider {
       backdrop-filter: blur(8px);
     }
 
+    .badge-stream {
+      background: rgba(16, 185, 129, 0.25);
+      color: #34d399;
+      border: 1px solid rgba(52, 211, 153, 0.3);
+    }
+
     .top-right {
       display: flex;
       align-items: center;
@@ -305,7 +466,6 @@ class SimpleVideoPlayerEditorProvider {
       border-color: rgba(255, 255, 255, 0.35);
     }
 
-    /* Bottom Control Bar Overlay */
     #bottom-bar-wrapper {
       position: absolute;
       bottom: 0;
@@ -321,7 +481,6 @@ class SimpleVideoPlayerEditorProvider {
       pointer-events: auto;
     }
 
-    /* Floating / Hide Controls */
     .controls-hidden #top-bar {
       opacity: 0;
       transform: translateY(-8px);
@@ -336,7 +495,6 @@ class SimpleVideoPlayerEditorProvider {
       cursor: none;
     }
 
-    /* Main Control Bar */
     .controls-bar {
       height: 44px;
       background: rgba(24, 26, 31, 0.88);
@@ -350,7 +508,6 @@ class SimpleVideoPlayerEditorProvider {
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
     }
 
-    /* Control Buttons */
     .ctrl-btn {
       background: transparent;
       border: none;
@@ -374,7 +531,6 @@ class SimpleVideoPlayerEditorProvider {
       transform: scale(0.95);
     }
 
-    /* Highlighted / Active Loop Button (Blue highlight exactly as in user image) */
     .ctrl-btn.btn-active-blue {
       background: #007acc !important;
       color: #ffffff !important;
@@ -384,7 +540,6 @@ class SimpleVideoPlayerEditorProvider {
       background: #0088e5 !important;
     }
 
-    /* A-B Repeat Buttons */
     .ab-btn {
       font-size: 13px;
       font-weight: 700;
@@ -412,7 +567,6 @@ class SimpleVideoPlayerEditorProvider {
       font-weight: 800;
     }
 
-    /* Volume container */
     .volume-group {
       display: flex;
       align-items: center;
@@ -452,7 +606,6 @@ class SimpleVideoPlayerEditorProvider {
       box-shadow: 0 0 4px rgba(0,0,0,0.4);
     }
 
-    /* Seekbar in bar */
     .seekbar-container {
       flex: 1;
       height: 28px;
@@ -511,7 +664,6 @@ class SimpleVideoPlayerEditorProvider {
       transform: translate(-50%, -50%) scale(1.25);
     }
 
-    /* A-B region markers on seekbar */
     .ab-marker {
       position: absolute;
       top: -3px;
@@ -536,7 +688,6 @@ class SimpleVideoPlayerEditorProvider {
       z-index: 1;
     }
 
-    /* Hover preview tooltip */
     #seek-tooltip {
       position: absolute;
       bottom: 34px;
@@ -555,7 +706,6 @@ class SimpleVideoPlayerEditorProvider {
       z-index: 20;
     }
 
-    /* Time display */
     .time-display {
       font-size: 12px;
       font-variant-numeric: tabular-nums;
@@ -564,7 +714,6 @@ class SimpleVideoPlayerEditorProvider {
       margin: 0 4px;
     }
 
-    /* Speed Menu Dropup */
     .speed-container {
       position: relative;
     }
@@ -619,7 +768,6 @@ class SimpleVideoPlayerEditorProvider {
       background: rgba(56, 189, 248, 0.12);
     }
 
-    /* Error Overlay */
     #error-overlay {
       position: absolute;
       inset: 0;
@@ -668,7 +816,6 @@ class SimpleVideoPlayerEditorProvider {
       background: #008be5;
     }
 
-    /* Notification Toast */
     #toast {
       position: absolute;
       top: 68px;
@@ -695,7 +842,6 @@ class SimpleVideoPlayerEditorProvider {
       transform: translateX(-50%) translateY(0);
     }
 
-    /* Big Play/Pause Center Animation */
     #center-indicator {
       position: absolute;
       top: 50%;
@@ -722,11 +868,11 @@ class SimpleVideoPlayerEditorProvider {
 </head>
 <body>
   <div id="player-container" tabindex="0">
-    <!-- Top Header Overlay -->
     <div id="top-bar">
       <div class="top-left">
         <span class="video-title" id="title-text" title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</span>
         <span class="badge" id="size-badge">${escapeHtml(fileSize)}</span>
+        <span class="badge badge-stream" title="Direct 64-bit HTTP Range Streaming (Zero memory consumption)">HTTP 206 Stream</span>
         <span class="badge" id="res-badge" style="display:none;"></span>
       </div>
       <div class="top-right">
@@ -741,14 +887,13 @@ class SimpleVideoPlayerEditorProvider {
       </div>
     </div>
 
-    <!-- Center Play/Pause indicator -->
     <div id="center-indicator">
       <svg id="indicator-icon" width="36" height="36" viewBox="0 0 24 24" fill="currentColor">
         <polygon points="5 3 19 12 5 21 5 3"></polygon>
       </svg>
     </div>
 
-    <!-- Video Element (Zero memory footprint Range streaming via asWebviewUri) -->
+    <!-- Video Element using direct HTTP 206 Range Streamer -->
     <video
       id="video"
       src="${videoSrc}"
@@ -759,10 +904,8 @@ class SimpleVideoPlayerEditorProvider {
       ${subtitleSrc ? `<track src="${subtitleSrc}" kind="subtitles" srclang="en" label="${escapeHtml(subtitleLabel || 'Subtitles')}" default>` : ''}
     </video>
 
-    <!-- Bottom Controls Overlay -->
     <div id="bottom-bar-wrapper">
       <div class="controls-bar">
-        <!-- Play / Pause -->
         <button class="ctrl-btn" id="btn-play" title="Play / Pause (Space)">
           <svg id="play-icon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
             <polygon points="5 3 19 12 5 21 5 3"></polygon>
@@ -773,7 +916,6 @@ class SimpleVideoPlayerEditorProvider {
           </svg>
         </button>
 
-        <!-- 10s Rewind (↺10) -->
         <button class="ctrl-btn" id="btn-rewind" title="Rewind 10s (Left Arrow / J)">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
@@ -782,7 +924,6 @@ class SimpleVideoPlayerEditorProvider {
           </svg>
         </button>
 
-        <!-- 10s Forward (↻10) -->
         <button class="ctrl-btn" id="btn-forward" title="Forward 10s (Right Arrow / L)">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M21 12a9 9 0 1 1-9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
@@ -791,7 +932,6 @@ class SimpleVideoPlayerEditorProvider {
           </svg>
         </button>
 
-        <!-- Loop / Repeat Button (Blue highlight when active, exactly matches user's image) -->
         <button class="ctrl-btn ${autoLoop ? 'btn-active-blue' : ''}" id="btn-loop" title="Toggle Auto-Repeat / Loop (R)">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="17 1 21 5 17 9"/>
@@ -801,13 +941,9 @@ class SimpleVideoPlayerEditorProvider {
           </svg>
         </button>
 
-        <!-- A-B Repeat: A Button -->
         <button class="ab-btn" id="btn-ab-a" title="Set Point A (Current Time)">A</button>
-
-        <!-- A-B Repeat: B Button -->
         <button class="ab-btn" id="btn-ab-b" title="Set Point B (Current Time)">B</button>
 
-        <!-- Volume & Mute -->
         <div class="volume-group" id="vol-group">
           <button class="ctrl-btn" id="btn-vol" title="Mute / Unmute (M)">
             <svg id="vol-high-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -826,7 +962,6 @@ class SimpleVideoPlayerEditorProvider {
           </div>
         </div>
 
-        <!-- Seekbar Container with Progress and Tooltip -->
         <div class="seekbar-container" id="seekbar-box">
           <div id="seek-tooltip">0:00</div>
           <div class="seekbar-bg">
@@ -839,15 +974,12 @@ class SimpleVideoPlayerEditorProvider {
           </div>
         </div>
 
-        <!-- Time Display (0:00 / 0:10) -->
         <div class="time-display" id="time-display">0:00 / 0:00</div>
 
-        <!-- CC Subtitles Toggle -->
         <button class="ctrl-btn" id="btn-cc" title="Toggle Subtitles / Captions">
           <span style="font-size: 11px; font-weight: 700; border: 1.5px solid currentColor; border-radius: 3px; padding: 1px 3px;">CC</span>
         </button>
 
-        <!-- Speed Dropup -->
         <div class="speed-container">
           <button class="speed-btn" id="btn-speed" title="Playback Speed">1.0x</button>
           <div class="speed-menu" id="speed-menu">
@@ -862,7 +994,6 @@ class SimpleVideoPlayerEditorProvider {
           </div>
         </div>
 
-        <!-- Picture in Picture (PiP) -->
         <button class="ctrl-btn" id="btn-pip" title="Picture in Picture">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <rect x="2" y="4" width="20" height="16" rx="2"/>
@@ -870,7 +1001,6 @@ class SimpleVideoPlayerEditorProvider {
           </svg>
         </button>
 
-        <!-- Fullscreen -->
         <button class="ctrl-btn" id="btn-fs" title="Fullscreen (F)">
           <svg id="fs-enter-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
@@ -882,17 +1012,16 @@ class SimpleVideoPlayerEditorProvider {
       </div>
     </div>
 
-    <!-- Error Overlay (for unsupported codecs or missing files) -->
+    <!-- Error Overlay (for unsupported codecs like ProRes, HEVC, or corrupted files) -->
     <div id="error-overlay">
       <div class="error-icon">⚠️</div>
       <div class="error-title">Unable to Play Video in VS Code</div>
       <div class="error-desc" id="error-desc-text">
         This video format or codec might not be supported natively by VS Code's built-in Chromium player (e.g., ProRes or certain audio codecs). You can play it seamlessly in your system's default media player (QuickTime, VLC, etc.).
       </div>
-      <button class="error-btn" id="btn-error-external">Open with External Player</button>
+      <button class="error-btn" id="btn-error-external">Open with External Player (QuickTime / VLC)</button>
     </div>
 
-    <!-- Toast Notification -->
     <div id="toast">
       <span id="toast-text">Loop: ON</span>
     </div>
@@ -901,7 +1030,6 @@ class SimpleVideoPlayerEditorProvider {
   <script>
     const vscode = acquireVsCodeApi();
 
-    // Elements
     const container = document.getElementById('player-container');
     const video = document.getElementById('video');
     const btnPlay = document.getElementById('btn-play');
@@ -935,6 +1063,7 @@ class SimpleVideoPlayerEditorProvider {
     const btnExternal = document.getElementById('btn-external');
     const btnReveal = document.getElementById('btn-reveal');
     const errorOverlay = document.getElementById('error-overlay');
+    const errorDescText = document.getElementById('error-desc-text');
     const btnErrorExternal = document.getElementById('btn-error-external');
     const toast = document.getElementById('toast');
     const toastText = document.getElementById('toast-text');
@@ -942,7 +1071,6 @@ class SimpleVideoPlayerEditorProvider {
     const indicatorIcon = document.getElementById('indicator-icon');
     const resBadge = document.getElementById('res-badge');
 
-    // States
     let isLooping = ${autoLoop ? 'true' : 'false'};
     let abPointA = null;
     let abPointB = null;
@@ -950,7 +1078,6 @@ class SimpleVideoPlayerEditorProvider {
     let isSeeking = false;
     let hideControlsTimeout = null;
 
-    // Toast helper
     function showToast(msg) {
       toastText.textContent = msg;
       toast.classList.add('show');
@@ -960,7 +1087,6 @@ class SimpleVideoPlayerEditorProvider {
       }, 1600);
     }
 
-    // Format seconds to mm:ss or hh:mm:ss
     function formatTime(sec) {
       if (isNaN(sec) || !isFinite(sec)) return "0:00";
       const totalSec = Math.floor(sec);
@@ -975,7 +1101,6 @@ class SimpleVideoPlayerEditorProvider {
       return \`\${m}:\${sStr}\`;
     }
 
-    // Update UI elements for play/pause
     function updatePlayState(playing) {
       if (playing) {
         playIcon.style.display = 'none';
@@ -986,7 +1111,6 @@ class SimpleVideoPlayerEditorProvider {
       }
     }
 
-    // Trigger center icon animation
     function triggerCenterAnim(iconType) {
       if (iconType === 'play') {
         indicatorIcon.innerHTML = '<polygon points="5 3 19 12 5 21 5 3"></polygon>';
@@ -994,12 +1118,11 @@ class SimpleVideoPlayerEditorProvider {
         indicatorIcon.innerHTML = '<rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect>';
       }
       centerIndicator.classList.remove('animate');
-      void centerIndicator.offsetWidth; // re-flow
+      void centerIndicator.offsetWidth;
       centerIndicator.classList.add('animate');
       setTimeout(() => centerIndicator.classList.remove('animate'), 400);
     }
 
-    // Toggle Play / Pause
     function togglePlay() {
       if (video.paused || video.ended) {
         video.play().catch(e => console.log('Autoplay blocked:', e));
@@ -1010,7 +1133,6 @@ class SimpleVideoPlayerEditorProvider {
       }
     }
 
-    // Loop Toggle (Key requirement: "繰り返しボタンをON場合、その動画自動に繰り返すようにして欲しいです。（動画の最後まで終わったら、すぐにその動画を再再生する）")
     function setLoop(state) {
       isLooping = state;
       video.loop = state;
@@ -1038,14 +1160,12 @@ class SimpleVideoPlayerEditorProvider {
       }
     });
 
-    // Timeupdate handler (handles progress bar & A-B loop)
     video.addEventListener('timeupdate', () => {
       if (isSeeking) return;
 
       const cur = video.currentTime;
       const dur = video.duration || 0;
 
-      // Handle A-B loop
       if (abPointA !== null && abPointB !== null && abPointB > abPointA) {
         if (cur >= abPointB || cur < abPointA) {
           video.currentTime = abPointA;
@@ -1054,7 +1174,6 @@ class SimpleVideoPlayerEditorProvider {
         }
       }
 
-      // Update progress bar
       if (dur > 0) {
         const pct = (cur / dur) * 100;
         seekProg.style.width = pct + '%';
@@ -1063,7 +1182,6 @@ class SimpleVideoPlayerEditorProvider {
       timeDisplay.textContent = \`\${formatTime(cur)} / \${formatTime(dur)}\`;
     });
 
-    // Progress (buffered chunks)
     video.addEventListener('progress', () => {
       const dur = video.duration || 0;
       if (dur > 0 && video.buffered.length > 0) {
@@ -1072,18 +1190,15 @@ class SimpleVideoPlayerEditorProvider {
       }
     });
 
-    // Video metadata loaded
     video.addEventListener('loadedmetadata', () => {
       const dur = video.duration || 0;
       timeDisplay.textContent = \`\${formatTime(video.currentTime)} / \${formatTime(dur)}\`;
 
-      // Resolution badge
       if (video.videoWidth && video.videoHeight) {
         resBadge.textContent = \`\${video.videoWidth}×\${video.videoHeight}\`;
         resBadge.style.display = 'inline-block';
       }
 
-      // Initial loop state
       video.loop = isLooping;
 
       ${autoPlay ? `
@@ -1099,13 +1214,23 @@ class SimpleVideoPlayerEditorProvider {
     video.addEventListener('play', () => updatePlayState(true));
     video.addEventListener('pause', () => updatePlayState(false));
 
-    // Error handling (unsupported codecs, e.g. ProRes MOV in Chromium)
+    // Detailed error handling for unsupported codecs (e.g. ProRes MOV)
     video.addEventListener('error', (e) => {
-      console.error('Video Error:', video.error);
+      const err = video.error;
+      let reason = 'This video format or codec is not supported by VS Code\\'s built-in browser engine.';
+      if (err) {
+        if (err.code === 4) {
+          reason = 'The video codec (e.g. Apple ProRes, DNxHD, or unsupported HEVC) cannot be decoded by VS Code\\'s browser engine.';
+        } else if (err.code === 3) {
+          reason = 'A decode error occurred while trying to play this video.';
+        } else if (err.code === 2) {
+          reason = 'A network/streaming error occurred while reading the file.';
+        }
+      }
+      errorDescText.textContent = reason + ' Please click below to play it seamlessly in your system\\'s default player (QuickTime / VLC).';
       errorOverlay.classList.add('show');
     });
 
-    // Control bar button event listeners
     btnPlay.addEventListener('click', togglePlay);
     video.addEventListener('click', togglePlay);
     video.addEventListener('dblclick', toggleFullscreen);
@@ -1122,7 +1247,6 @@ class SimpleVideoPlayerEditorProvider {
 
     btnLoop.addEventListener('click', toggleLoop);
 
-    // A-B Repeat Implementation
     function updateAbMarkers() {
       const dur = video.duration || 0;
       if (dur <= 0) return;
@@ -1161,7 +1285,6 @@ class SimpleVideoPlayerEditorProvider {
 
     btnAbA.addEventListener('click', () => {
       if (abPointA !== null && abPointB !== null) {
-        // Reset both
         abPointA = null;
         abPointB = null;
         updateAbMarkers();
@@ -1198,7 +1321,6 @@ class SimpleVideoPlayerEditorProvider {
       }
     });
 
-    // Volume & Mute
     function setVolume(v) {
       video.volume = Math.max(0, Math.min(1, v));
       volSlider.value = video.volume;
@@ -1232,7 +1354,6 @@ class SimpleVideoPlayerEditorProvider {
       setVolume(lastVolume);
     });
 
-    // Seekbar Dragging & Hover
     function seekToEvent(e) {
       const rect = seekbarBox.getBoundingClientRect();
       const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -1268,7 +1389,6 @@ class SimpleVideoPlayerEditorProvider {
       seekTooltip.style.opacity = '0';
     });
 
-    // Speed Selector
     btnSpeed.addEventListener('click', (e) => {
       e.stopPropagation();
       speedMenu.classList.toggle('show');
@@ -1292,7 +1412,6 @@ class SimpleVideoPlayerEditorProvider {
       }
     });
 
-    // Subtitles (CC)
     let ccEnabled = true;
     btnCc.addEventListener('click', () => {
       if (video.textTracks && video.textTracks.length > 0) {
@@ -1307,7 +1426,6 @@ class SimpleVideoPlayerEditorProvider {
       }
     });
 
-    // Picture in Picture
     btnPip.addEventListener('click', async () => {
       try {
         if (document.pictureInPictureElement) {
@@ -1320,7 +1438,6 @@ class SimpleVideoPlayerEditorProvider {
       }
     });
 
-    // Fullscreen
     function toggleFullscreen() {
       if (!document.fullscreenElement) {
         container.requestFullscreen().catch(() => {});
@@ -1341,7 +1458,6 @@ class SimpleVideoPlayerEditorProvider {
       }
     });
 
-    // External App Openers
     btnExternal.addEventListener('click', () => {
       vscode.postMessage({ command: 'openExternal' });
     });
@@ -1352,7 +1468,6 @@ class SimpleVideoPlayerEditorProvider {
       vscode.postMessage({ command: 'openExternal' });
     });
 
-    // Auto-hide controls when mouse is inactive during playback
     function resetHideControlsTimer() {
       container.classList.remove('controls-hidden');
       clearTimeout(hideControlsTimeout);
@@ -1369,7 +1484,6 @@ class SimpleVideoPlayerEditorProvider {
     container.addEventListener('mouseenter', resetHideControlsTimer);
     video.addEventListener('play', resetHideControlsTimer);
 
-    // Keyboard Shortcuts
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT') return;
 
@@ -1436,7 +1550,6 @@ class SimpleVideoPlayerEditorProvider {
       resetHideControlsTimer();
     });
 
-    // Mouse wheel volume control
     container.addEventListener('wheel', (e) => {
       e.preventDefault();
       const delta = e.deltaY < 0 ? 0.05 : -0.05;
@@ -1445,7 +1558,6 @@ class SimpleVideoPlayerEditorProvider {
       resetHideControlsTimer();
     }, { passive: false });
 
-    // Focus container on mount
     container.focus();
   </script>
 </body>
@@ -1473,5 +1585,6 @@ function escapeHtml(str) {
 
 module.exports = {
   activate,
-  SimpleVideoPlayerEditorProvider
+  SimpleVideoPlayerEditorProvider,
+  LocalVideoServer
 };

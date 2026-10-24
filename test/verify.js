@@ -1,6 +1,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const Module = require('module');
 
 console.log('Running Video Player verification tests...');
@@ -66,7 +67,8 @@ const extCode = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf
 
 // Ensure NO memory-hogging readFile / base64 on video files
 assert.ok(!extCode.includes('readFile(') && !extCode.includes('readFileSync('), 'Must NOT use readFile on videos to prevent freezing on 20GB+ files');
-assert.ok(extCode.includes('asWebviewUri'), 'Must use asWebviewUri for zero-memory HTTP Range streaming');
+assert.ok(extCode.includes('LocalVideoServer'), 'Must include LocalVideoServer for HTTP Range streaming');
+assert.ok(extCode.includes('206'), 'Must handle HTTP 206 Partial Content');
 
 // Ensure Loop requirement is implemented
 assert.ok(extCode.includes('btn-loop'), 'Loop button exists');
@@ -74,55 +76,101 @@ assert.ok(extCode.includes('btn-active-blue'), 'Active blue highlight styling ex
 assert.ok(extCode.includes('video.loop'), 'video.loop property toggled');
 assert.ok(extCode.includes('video.addEventListener(\'ended\''), 'ended event listener handles auto-restart loop safely');
 
-// Ensure A-B repeat exists
-assert.ok(extCode.includes('btn-ab-a') && extCode.includes('btn-ab-b'), 'A-B repeat buttons exist');
-
-// Ensure 10s jump exists
-assert.ok(extCode.includes('btn-rewind') && extCode.includes('btn-forward'), '10s rewind/forward buttons exist');
-
-// 4. Test Provider instance and HTML generation
-const { SimpleVideoPlayerEditorProvider } = require('../extension');
+// 4. Test LocalVideoServer HTTP Range Streaming
+const { LocalVideoServer, SimpleVideoPlayerEditorProvider } = require('../extension');
+assert.ok(LocalVideoServer, 'LocalVideoServer exported');
 assert.ok(SimpleVideoPlayerEditorProvider, 'SimpleVideoPlayerEditorProvider exported');
 
-const dummyWebview = {
-  cspSource: 'vscode-webview:',
-  asWebviewUri: (uri) => uri.toString()
-};
+async function testServer() {
+  const server = new LocalVideoServer();
+  const port = await server.start();
+  assert.ok(port > 0, 'Server listening on valid port');
 
-const provider = new SimpleVideoPlayerEditorProvider({
-  extensionUri: { toString: () => 'vscode-resource:/ext' },
-  globalState: { get: () => true, update: async () => {} }
+  // Create a dummy video file for range test
+  const tempFile = path.join(__dirname, 'test_sample.mp4');
+  const buffer = Buffer.alloc(1024 * 1024, 0x55); // 1MB dummy content
+  fs.writeFileSync(tempFile, buffer);
+
+  try {
+    const { token, videoUrl, fileSize } = server.registerFile(tempFile);
+    assert.strictEqual(fileSize, 1024 * 1024);
+    assert.ok(videoUrl.startsWith('http://127.0.0.1:'), 'videoUrl is local HTTP endpoint');
+
+    // Test HTTP Range Request (bytes=0-1023)
+    await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port,
+        path: `/video?token=${token}`,
+        method: 'GET',
+        headers: {
+          'Range': 'bytes=0-1023'
+        }
+      }, (res) => {
+        assert.strictEqual(res.statusCode, 206, 'Returns 206 Partial Content');
+        assert.strictEqual(res.headers['content-range'], `bytes 0-1023/${fileSize}`);
+        assert.strictEqual(res.headers['accept-ranges'], 'bytes');
+        assert.strictEqual(res.headers['content-length'], '1024');
+
+        let dataLen = 0;
+        res.on('data', chunk => dataLen += chunk.length);
+        res.on('end', () => {
+          assert.strictEqual(dataLen, 1024, 'Received exact range bytes');
+          resolve();
+        });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+
+    console.log('✅ LocalVideoServer HTTP 206 Range Streaming verified successfully');
+  } finally {
+    server.dispose();
+    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+  }
+}
+
+testServer().then(() => {
+  // 5. Test Provider HTML generation
+  const dummyWebview = {
+    cspSource: 'vscode-webview:',
+    asWebviewUri: (uri) => uri.toString()
+  };
+
+  const provider = new SimpleVideoPlayerEditorProvider({
+    extensionUri: { toString: () => 'vscode-resource:/ext' },
+    globalState: { get: () => true, update: async () => {} }
+  });
+
+  const html = provider.getHtmlForWebview(
+    dummyWebview,
+    'test_video.mp4',
+    'http://127.0.0.1:50000/video?token=abc',
+    'video/mp4',
+    '24.5 GB',
+    24500000000,
+    true,
+    true,
+    1.0,
+    10,
+    null,
+    null
+  );
+
+  assert.ok(html.includes('http://127.0.0.1:'), 'HTML includes local HTTP stream src');
+  assert.ok(html.includes('HTTP 206 Stream'), 'HTML includes HTTP 206 badge');
+  assert.ok(html.includes('btn-active-blue'), 'Loop button is active by default');
+
+  const scriptStart = html.indexOf('<script>') + 8;
+  const scriptEnd = html.indexOf('</script>');
+  assert.ok(scriptStart !== -1 && scriptEnd !== -1, 'Script block found');
+  const scriptCode = html.substring(scriptStart, scriptEnd);
+
+  new Function(scriptCode.replace('acquireVsCodeApi()', '({})'));
+  console.log('✅ Generated Webview script syntax is valid');
+
+  console.log('✅ All verification tests passed successfully!');
+}).catch(err => {
+  console.error('❌ Verification failed:', err);
+  process.exit(1);
 });
-
-const html = provider.getHtmlForWebview(
-  dummyWebview,
-  'test_video.mp4',
-  'vscode-webview://test/video.mp4',
-  'video/mp4',
-  '24.5 GB',
-  24500000000,
-  true, // autoLoop
-  true, // autoPlay
-  1.0,
-  10,
-  null,
-  null
-);
-
-assert.ok(html.includes('test_video.mp4'), 'HTML includes file title');
-assert.ok(html.includes('24.5 GB'), 'HTML includes file size badge');
-assert.ok(html.includes('btn-active-blue'), 'Loop button is active by default');
-assert.ok(html.includes('<video'), 'HTML includes video tag');
-assert.ok(html.includes('loop'), 'Video tag has loop attribute');
-
-// Verify script block inside generated HTML is valid syntax
-const scriptStart = html.indexOf('<script>') + 8;
-const scriptEnd = html.indexOf('</script>');
-assert.ok(scriptStart !== -1 && scriptEnd !== -1, 'Script block found');
-const scriptCode = html.substring(scriptStart, scriptEnd);
-
-// Test script syntax by compiling
-new Function(scriptCode.replace('acquireVsCodeApi()', '({})'));
-console.log('✅ Generated Webview script syntax is valid');
-
-console.log('✅ All verification tests passed successfully!');

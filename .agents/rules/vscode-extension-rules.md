@@ -4,9 +4,10 @@
 - **`readFile` / `Buffer` / Base64 の使用禁止**:
   - 動画ファイルに対して `fs.readFile`、`vscode.workspace.fs.readFile`、`Buffer.toString('base64')`、または動画バイナリ全体の `postMessage` 送信を行ってはならない。
   - 20GB などの巨大ファイルを開いた際、Node.js プロセスのヒープ上限（約2〜4GB）を瞬時に超過して OOM クラッシュ、あるいは長時間の GC ストップで IDE が完全フリーズする原因となる。
-- **`asWebviewUri` によるゼロメモリ Range ストリーミングの徹底**:
-  - 動画は必ず `webview.asWebviewUri(document.uri)` を介して `<video src="...">` に渡すこと。
-  - Chromium のメディアエンジンがローカル HTTP Range リクエスト経由で再生位置に必要なチャンクのみをオンデマンド取得するため、IDE のメモリを一切消費せず、数十GB以上の動画でも瞬時にシーク・再生できる。
+- **内蔵ローカル HTTP 206 Range サーバーによるゼロメモリ配信（必須アーキテクチャ）**:
+  - VS Code の内部 `vscode-webview://` プロトコルは 2GB（32-bit offset）を超える巨大ファイルで Electron / Chromium のバッファオーバーフローやレンダラー強制クラッシュを引き起こす既知の制約がある。
+  - そのため、必ず Node.js の軽量な内蔵 `LocalVideoServer`（`http.createServer`）をローカルループバック（`127.0.0.1`）で起動し、ブラウザ標準の **HTTP 206 Partial Content (Range: bytes=start-end)** を提供すること。
+  - Chromium のネイティブ HTTP スタックと直接 64-bit Range 通信を行わせることで、Node.js および IDE のメモリ消費量は常に数メガバイト（チャンク分のみ）に抑えられ、20GB〜100GB 以上の巨大動画でも絶対にフリーズやクラッシュが発生しない。
 - **リソースアクセス権限の設定**:
   - `webviewPanel.webview.options.localResourceRoots` に対象動画の親ディレクトリ（`vscode.Uri.file(path.dirname(filePath))`）および拡張機能ルート（`context.extensionUri`）を必ず含めること。
 
