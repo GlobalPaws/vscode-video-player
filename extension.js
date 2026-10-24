@@ -11,13 +11,20 @@ class LocalVideoServer {
     this.server = null;
     this.port = 0;
     this.activeFiles = new Map(); // token -> { filePath, fileSize, mimeType }
+    this.requestCounts = new Map(); // token -> { count, lastReset }
   }
 
   async start() {
     if (this.server) return this.port;
 
     return new Promise((resolve, reject) => {
-      this.server = http.createServer((req, res) => {
+      this.server = http.createServer(async (req, res) => {
+        // Safe socket timeouts to prevent hung connections
+        req.socket.setTimeout(15000);
+        req.socket.on('timeout', () => {
+          req.socket.destroy();
+        });
+
         // CORS Headers for VS Code Webview
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
@@ -35,10 +42,27 @@ class LocalVideoServer {
           const token = url.searchParams.get('token');
           const fileInfo = this.activeFiles.get(token);
 
-          if (!fileInfo || !fs.existsSync(fileInfo.filePath)) {
+          if (!fileInfo) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
             res.end('Video not found or token expired');
             return;
+          }
+
+          // Rate-limiting / loop-protection per token:
+          // Prevent runaway loops from Chromium if a codec fails to decode
+          const now = Date.now();
+          let rate = this.requestCounts.get(token);
+          if (!rate || now - rate.lastReset > 1000) {
+            rate = { count: 1, lastReset: now };
+            this.requestCounts.set(token, rate);
+          } else {
+            rate.count++;
+            if (rate.count > 60) {
+              // Too many requests within 1s: throttle to protect Extension Host
+              res.writeHead(429, { 'Content-Type': 'text/plain', 'Retry-After': '1' });
+              res.end('Too Many Requests');
+              return;
+            }
           }
 
           const { filePath, fileSize, mimeType } = fileInfo;
@@ -58,8 +82,8 @@ class LocalVideoServer {
             } else {
               // Only stream first 2MB if full file is requested without Range
               const stream = fs.createReadStream(filePath, { start: 0, end: Math.min(fileSize - 1, 2097151) });
+              cleanupStream(stream, req, res);
               stream.pipe(res);
-              req.on('close', () => stream.destroy());
             }
             return;
           }
@@ -78,8 +102,8 @@ class LocalVideoServer {
             return;
           }
 
-          // Cap max chunk to 16MB to optimize socket throughput and avoid buffering bottlenecks
-          const maxChunk = 16 * 1024 * 1024;
+          // Cap max chunk to 8MB to prevent socket buffer backpressure
+          const maxChunk = 8 * 1024 * 1024;
           if (end - start + 1 > maxChunk) {
             end = start + maxChunk - 1;
           }
@@ -95,18 +119,8 @@ class LocalVideoServer {
             'Cache-Control': 'no-cache'
           });
 
+          cleanupStream(stream, req, res);
           stream.pipe(res);
-
-          stream.on('error', () => {
-            if (!res.headersSent) {
-              res.writeHead(500);
-            }
-            res.end();
-          });
-
-          req.on('close', () => {
-            stream.destroy();
-          });
         } catch {
           if (!res.headersSent) {
             res.writeHead(500);
@@ -114,6 +128,10 @@ class LocalVideoServer {
           res.end();
         }
       });
+
+      // Strict timeouts to keep connection pools clean
+      this.server.requestTimeout = 15000;
+      this.server.keepAliveTimeout = 5000;
 
       this.server.listen(0, '127.0.0.1', () => {
         this.port = this.server.address().port;
@@ -124,16 +142,15 @@ class LocalVideoServer {
     });
   }
 
-  registerFile(filePath) {
+  async registerFile(filePath) {
     let stat;
     try {
-      stat = fs.statSync(filePath);
+      stat = await fs.promises.stat(filePath);
     } catch {
       stat = { size: 0 };
     }
 
     const ext = path.extname(filePath).toLowerCase();
-    // Chromium plays H.264/AAC MOV files as video/mp4 container
     let mimeType = 'video/mp4';
     if (ext === '.webm') mimeType = 'video/webm';
 
@@ -150,6 +167,7 @@ class LocalVideoServer {
 
   unregisterFile(token) {
     this.activeFiles.delete(token);
+    this.requestCounts.delete(token);
   }
 
   dispose() {
@@ -158,7 +176,28 @@ class LocalVideoServer {
       this.server = null;
     }
     this.activeFiles.clear();
+    this.requestCounts.clear();
   }
+}
+
+function cleanupStream(stream, req, res) {
+  let destroyed = false;
+  const destroy = () => {
+    if (!destroyed) {
+      destroyed = true;
+      stream.destroy();
+    }
+  };
+  req.on('close', destroy);
+  res.on('close', destroy);
+  res.on('finish', destroy);
+  stream.on('error', (err) => {
+    destroy();
+    if (!res.headersSent) {
+      res.writeHead(500);
+    }
+    res.end();
+  });
 }
 
 const localVideoServer = new LocalVideoServer();
@@ -242,9 +281,9 @@ class SimpleVideoPlayerEditorProvider {
     const filePath = document.uri.fsPath;
     const fileDir = vscode.Uri.file(path.dirname(filePath));
 
-    // Ensure Local HTTP Range Server is running
+    // Ensure Local HTTP Range Server is running (non-blocking)
     await localVideoServer.start();
-    const { token, videoUrl, fileSize } = localVideoServer.registerFile(filePath);
+    const { token, videoUrl, fileSize } = await localVideoServer.registerFile(filePath);
 
     // Unregister file token when Webview panel is closed
     webviewPanel.onDidDispose(() => {
@@ -805,7 +844,7 @@ class SimpleVideoPlayerEditorProvider {
       background: #007acc;
       color: #ffffff;
       border: none;
-      padding: 8px 18px;
+      padding: 10px 22px;
       font-size: 13px;
       font-weight: 600;
       border-radius: 6px;
@@ -1015,9 +1054,9 @@ class SimpleVideoPlayerEditorProvider {
     <!-- Error Overlay (for unsupported codecs like ProRes, HEVC, or corrupted files) -->
     <div id="error-overlay">
       <div class="error-icon">⚠️</div>
-      <div class="error-title">Unable to Play Video in VS Code</div>
+      <div class="error-title">Cannot Decode in VS Code (Protected Mode)</div>
       <div class="error-desc" id="error-desc-text">
-        This video format or codec might not be supported natively by VS Code's built-in Chromium player (e.g., ProRes or certain audio codecs). You can play it seamlessly in your system's default media player (QuickTime, VLC, etc.).
+        This video uses a high-bitrate or professional codec (such as Apple ProRes or 10-bit HEVC) that is not supported by VS Code's browser engine. Playback has been safely stopped to prevent IDE freezing. Please click below to play in your default external player.
       </div>
       <button class="error-btn" id="btn-error-external">Open with External Player (QuickTime / VLC)</button>
     </div>
@@ -1077,6 +1116,34 @@ class SimpleVideoPlayerEditorProvider {
     let lastVolume = ${defaultVolume};
     let isSeeking = false;
     let hideControlsTimeout = null;
+    let isKilled = false;
+
+    // Critical Kill-Switch: Completely tear down video pipeline to prevent Chromium/Electron IPC deadlock
+    function stopAndKillVideo() {
+      if (isKilled) return;
+      isKilled = true;
+      try {
+        video.pause();
+        video.removeAttribute('src'); // Detach HTTP stream immediately
+        video.load(); // Abort Chromium media demuxer & background threads
+      } catch (e) {
+        console.error('Error shutting down video:', e);
+      }
+    }
+
+    // Safety Watchdog: If metadata doesn't load within 7 seconds, kill pipeline to protect IDE
+    let loadWatchdog = setTimeout(() => {
+      if (!isKilled && (!video.videoWidth || !video.duration || isNaN(video.duration))) {
+        stopAndKillVideo();
+        errorDescText.textContent = 'Playback timed out. This large file appears to use an unsupported professional codec (such as Apple ProRes or 10-bit HEVC). To prevent VS Code from freezing, playback was safely detached. Please click below to play in QuickTime or VLC.';
+        errorOverlay.classList.add('show');
+      }
+    }, 7000);
+
+    // Unload safety on tab close
+    window.addEventListener('beforeunload', () => {
+      stopAndKillVideo();
+    });
 
     function showToast(msg) {
       toastText.textContent = msg;
@@ -1124,6 +1191,7 @@ class SimpleVideoPlayerEditorProvider {
     }
 
     function togglePlay() {
+      if (isKilled) return;
       if (video.paused || video.ended) {
         video.play().catch(e => console.log('Autoplay blocked:', e));
         triggerCenterAnim('play');
@@ -1135,7 +1203,7 @@ class SimpleVideoPlayerEditorProvider {
 
     function setLoop(state) {
       isLooping = state;
-      video.loop = state;
+      if (!isKilled) video.loop = state;
       if (state) {
         btnLoop.classList.add('btn-active-blue');
         showToast('Repeat / Loop: ON');
@@ -1150,8 +1218,8 @@ class SimpleVideoPlayerEditorProvider {
       setLoop(!isLooping);
     }
 
-    // Safety fallback for instantaneous restart on end
     video.addEventListener('ended', () => {
+      if (isKilled) return;
       if (isLooping) {
         video.currentTime = 0;
         video.play().catch(() => {});
@@ -1161,7 +1229,7 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     video.addEventListener('timeupdate', () => {
-      if (isSeeking) return;
+      if (isSeeking || isKilled) return;
 
       const cur = video.currentTime;
       const dur = video.duration || 0;
@@ -1183,6 +1251,7 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     video.addEventListener('progress', () => {
+      if (isKilled) return;
       const dur = video.duration || 0;
       if (dur > 0 && video.buffered.length > 0) {
         const bufferedEnd = video.buffered.end(video.buffered.length - 1);
@@ -1191,6 +1260,9 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     video.addEventListener('loadedmetadata', () => {
+      clearTimeout(loadWatchdog); // Cancel timeout safely
+      if (isKilled) return;
+
       const dur = video.duration || 0;
       timeDisplay.textContent = \`\${formatTime(video.currentTime)} / \${formatTime(dur)}\`;
 
@@ -1214,20 +1286,23 @@ class SimpleVideoPlayerEditorProvider {
     video.addEventListener('play', () => updatePlayState(true));
     video.addEventListener('pause', () => updatePlayState(false));
 
-    // Detailed error handling for unsupported codecs (e.g. ProRes MOV)
+    // Handle error with immediate pipeline termination to protect IDE
     video.addEventListener('error', (e) => {
+      clearTimeout(loadWatchdog);
+      stopAndKillVideo(); // Immediately cut off decoder to save IDE from locking up
+
       const err = video.error;
       let reason = 'This video format or codec is not supported by VS Code\\'s built-in browser engine.';
       if (err) {
         if (err.code === 4) {
-          reason = 'The video codec (e.g. Apple ProRes, DNxHD, or unsupported HEVC) cannot be decoded by VS Code\\'s browser engine.';
+          reason = 'The video codec (e.g. Apple ProRes, DNxHD, or 10-bit HEVC) cannot be decoded by VS Code\\'s browser engine.';
         } else if (err.code === 3) {
           reason = 'A decode error occurred while trying to play this video.';
         } else if (err.code === 2) {
           reason = 'A network/streaming error occurred while reading the file.';
         }
       }
-      errorDescText.textContent = reason + ' Please click below to play it seamlessly in your system\\'s default player (QuickTime / VLC).';
+      errorDescText.textContent = reason + ' Playback has been safely detached to keep your IDE responsive. Click below to open in your system\\'s default media player (QuickTime / VLC).';
       errorOverlay.classList.add('show');
     });
 
@@ -1236,11 +1311,13 @@ class SimpleVideoPlayerEditorProvider {
     video.addEventListener('dblclick', toggleFullscreen);
 
     btnRewind.addEventListener('click', () => {
+      if (isKilled) return;
       video.currentTime = Math.max(0, video.currentTime - ${skipSeconds});
       showToast('-${skipSeconds}s');
     });
 
     btnForward.addEventListener('click', () => {
+      if (isKilled) return;
       video.currentTime = Math.min(video.duration || 0, video.currentTime + ${skipSeconds});
       showToast('+${skipSeconds}s');
     });
@@ -1284,6 +1361,7 @@ class SimpleVideoPlayerEditorProvider {
     }
 
     btnAbA.addEventListener('click', () => {
+      if (isKilled) return;
       if (abPointA !== null && abPointB !== null) {
         abPointA = null;
         abPointB = null;
@@ -1303,6 +1381,7 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     btnAbB.addEventListener('click', () => {
+      if (isKilled) return;
       if (abPointB === null) {
         if (abPointA !== null && video.currentTime <= abPointA) {
           showToast('Point B must be after Point A');
@@ -1322,6 +1401,7 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     function setVolume(v) {
+      if (isKilled) return;
       video.volume = Math.max(0, Math.min(1, v));
       volSlider.value = video.volume;
       if (video.volume === 0) {
@@ -1336,6 +1416,7 @@ class SimpleVideoPlayerEditorProvider {
     }
 
     btnVol.addEventListener('click', () => {
+      if (isKilled) return;
       if (video.muted || video.volume === 0) {
         video.muted = false;
         setVolume(lastVolume > 0 ? lastVolume : 1.0);
@@ -1355,6 +1436,7 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     function seekToEvent(e) {
+      if (isKilled) return;
       const rect = seekbarBox.getBoundingClientRect();
       const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       const dur = video.duration || 0;
@@ -1364,6 +1446,7 @@ class SimpleVideoPlayerEditorProvider {
     }
 
     seekbarBox.addEventListener('mousedown', (e) => {
+      if (isKilled) return;
       isSeeking = true;
       seekToEvent(e);
       const onMouseMove = (ev) => seekToEvent(ev);
@@ -1377,6 +1460,7 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     seekbarBox.addEventListener('mousemove', (e) => {
+      if (isKilled) return;
       const rect = seekbarBox.getBoundingClientRect();
       const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       const dur = video.duration || 0;
@@ -1396,6 +1480,7 @@ class SimpleVideoPlayerEditorProvider {
 
     document.querySelectorAll('.speed-item').forEach(item => {
       item.addEventListener('click', () => {
+        if (isKilled) return;
         const spd = parseFloat(item.dataset.speed);
         video.playbackRate = spd;
         btnSpeed.textContent = spd === 1.0 ? '1.0x' : spd + 'x';
@@ -1414,6 +1499,7 @@ class SimpleVideoPlayerEditorProvider {
 
     let ccEnabled = true;
     btnCc.addEventListener('click', () => {
+      if (isKilled) return;
       if (video.textTracks && video.textTracks.length > 0) {
         ccEnabled = !ccEnabled;
         for (let i = 0; i < video.textTracks.length; i++) {
@@ -1427,6 +1513,7 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     btnPip.addEventListener('click', async () => {
+      if (isKilled) return;
       try {
         if (document.pictureInPictureElement) {
           await document.exitPictureInPicture();
@@ -1485,7 +1572,7 @@ class SimpleVideoPlayerEditorProvider {
     video.addEventListener('play', resetHideControlsTimer);
 
     window.addEventListener('keydown', (e) => {
-      if (e.target.tagName === 'INPUT') return;
+      if (e.target.tagName === 'INPUT' || isKilled) return;
 
       switch (e.code) {
         case 'Space':
@@ -1551,6 +1638,7 @@ class SimpleVideoPlayerEditorProvider {
     });
 
     container.addEventListener('wheel', (e) => {
+      if (isKilled) return;
       e.preventDefault();
       const delta = e.deltaY < 0 ? 0.05 : -0.05;
       setVolume(Math.max(0, Math.min(1, video.volume + delta)));

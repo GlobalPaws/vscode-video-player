@@ -92,7 +92,7 @@ async function testServer() {
   fs.writeFileSync(tempFile, buffer);
 
   try {
-    const { token, videoUrl, fileSize } = server.registerFile(tempFile);
+    const { token, videoUrl, fileSize } = await server.registerFile(tempFile);
     assert.strictEqual(fileSize, 1024 * 1024);
     assert.ok(videoUrl.startsWith('http://127.0.0.1:'), 'videoUrl is local HTTP endpoint');
 
